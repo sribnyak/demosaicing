@@ -1,178 +1,179 @@
 import numpy as np
 
 
+class BayerMasks:
+    def __init__(self, height, width):
+        assert(height % 2 == 0 and width % 2 == 0)
+        tiles = np.array([
+            [[1, 0], [0, 0]],
+            [[0, 0], [0, 1]],
+            [[0, 1], [0, 0]],
+            [[0, 0], [1, 0]]
+        ])
+        self.green_red_row, self.green_blue_row, self.red, self.blue = (
+            np.tile(tiles, (1, height // 2, width // 2)))
+        self.green = self.green_red_row + self.green_blue_row
+        self.red_blue = self.red + self.blue
+
+
 def apply_bayer_filter(image):
-    h, w, _ = image.shape
-    red = np.zeros(shape=(h, w), dtype=np.float64)
-    green = red.copy()
-    blue = red.copy()
-    for i in range(0, h, 2):
-        for j in range(0, w, 2):
-            green[i, j] = image[i, j, 1]
-        for j in range(1, w, 2):
-            red[i, j] = image[i, j, 0]
-    for i in range(1, h, 2):
-        for j in range(0, w, 2):
-            blue[i, j] = image[i, j, 2]
-        for j in range(1, w, 2):
-            green[i, j] = image[i, j, 1]
-    return red, green, blue
+    masks = BayerMasks(image.shape[0], image.shape[1])
+    red, green, blue = np.squeeze(np.dsplit(image, 3), axis=-1)
+    return red * masks.red, green * masks.green, blue * masks.blue
 
 
-def take(array2d, i, j):
-    if 0 <= i < array2d.shape[0] and 0 <= j < array2d.shape[1]:
-        return array2d[i, j]
-    return np.float64(0)
+def _directional_green_interpolation(bayer_data, masks, intermediate):
+    kernel = np.array([-0.25, 0.5, 0.5, 0.5, -0.25])
+    conv = lambda arr: np.convolve(arr, kernel, mode='same')
 
+    horizontal = np.apply_along_axis(conv, axis=1, arr=bayer_data)
+    vertical = np.apply_along_axis(conv, axis=0, arr=bayer_data)
+    green_h = bayer_data * masks.green + horizontal * masks.red_blue
+    green_v = bayer_data * masks.green + vertical * masks.red_blue
 
-def red_blue_positions(height, width):
-    first_non_green = 1
-    for i in range(height):
-        for j in range(first_non_green, width, 2):
-            yield i, j
-        first_non_green = 1 - first_non_green
-
-
-def directional_green_interpolation(bayer_data):
-    height, width = bayer_data.shape
-    green_h = bayer_data.copy()  # green positions are copied
-    green_v = bayer_data.copy()  # other values will be replaced
-
-    for i, j in red_blue_positions(height, width):
-        r = lambda k: take(bayer_data, i, j + k)  # r - relative indexing
-        green_h[i, j] = (r(1) + r(-1) + r(0)) / 2 - (r(2) + r(-2)) / 4
-        r = lambda k: take(bayer_data, i + k, j)
-        green_v[i, j] = (r(1) + r(-1) + r(0)) / 2 - (r(2) + r(-2)) / 4
+    if intermediate is not None:
+        intermediate.append(('step1_green_h', green_h))
+        intermediate.append(('step1_green_h', green_v))
 
     return green_h, green_v
 
 
-def green_decision(bayer_data, green_h, green_v,
-                   cardinal_directions_improvement=True):
-    height, width = bayer_data.shape
+def _weighted_window_sum_2d(array, coeff):
+    padding = coeff.shape[0] // 2
+    padded_array = np.pad(array, ((padding, padding), (padding, padding)))
+    view = np.lib.stride_tricks.sliding_window_view(padded_array, coeff.shape)
+    return np.einsum('ijkl,kl->ij', view, coeff)
 
-    # "chrominance" is R - G in red locations, B - G in blue locations
-    # and 0 in green locations
+
+def _green_decision(bayer_data, green_h, green_v, masks, intermediate):
     chrominance_h = bayer_data - green_h
     chrominance_v = bayer_data - green_v
 
-    # also 0 in green locations, this will be useful
-    gradient_h = chrominance_h.copy()
-    gradient_v = chrominance_v.copy()
-
-    for i, j in red_blue_positions(height, width):
-        gradient_h[i, j] -= take(chrominance_h, i, j + 2)
-        gradient_v[i, j] -= take(chrominance_v, i + 2, j)
-    gradient_h = np.abs(gradient_h)
-    gradient_v = np.abs(gradient_v)
-    # could be easily rewritten without loops
+    gradient_h = np.abs(chrominance_h -
+                        np.pad(chrominance_h, ((0, 0), (0, 2)))[:, 2:])
+    gradient_v = np.abs(chrominance_v -
+                        np.pad(chrominance_v, ((0, 2), (0, 0)))[2:])
 
     window = np.ones(shape=(5, 5), dtype=np.float64)
-    if cardinal_directions_improvement:
-        window[2, :] = 3
-        window[:, 2] = 3
+    window[2, :] = 3
+    window[:, 2] = 3
 
-    delta_h = np.zeros(shape=(height, width), dtype=np.float64)
-    delta_v = delta_h.copy()
-    padded_grad_h = np.zeros(shape=(height + 4, width + 4), dtype=np.float64)
-    padded_grad_v = padded_grad_h.copy()
-    padded_grad_h[2 : height + 2, 2 : width + 2] = gradient_h
-    padded_grad_v[2 : height + 2, 2 : width + 2] = gradient_v
-    green = green_h.copy()
-    for i, j in red_blue_positions(height, width):
-        delta_h[i, j] = np.sum(window * padded_grad_h[i : i + 5, j : j + 5])
-        delta_v[i, j] = np.sum(window * padded_grad_v[i : i + 5, j : j + 5])
-        if delta_v[i, j] < delta_h[i, j]:
-            green[i, j] = green_v[i, j]
+    delta_h = _weighted_window_sum_2d(gradient_h, window)
+    delta_v = _weighted_window_sum_2d(gradient_v, window)
 
-    return green, delta_h, delta_v
+    classifier_h = (delta_v >= delta_h).astype(masks.red.dtype)
+    green = green_h * classifier_h + green_v * (1 - classifier_h)
+
+    if intermediate is not None:
+        intermediate.append(('step2_green', green))
+        amp = min(1, max(delta_h.max(), delta_v.max()))
+        intermediate.append(('step2_delta_h', delta_h / amp))
+        intermediate.append(('step2_delta_v', delta_v / amp))
+
+    return green, classifier_h
 
 
-def red_blue_interpolation(bayer_data, green, delta_h, delta_v):
-    height, width = bayer_data.shape
-    red = bayer_data.copy()
-    blue = bayer_data.copy()
+def _red_blue_interpolation(bayer_data, green, classifier_h,
+                            masks, intermediate):
+    means_h = (np.pad(bayer_data, ((0, 0), (0, 2))) +
+               np.pad(bayer_data, ((0, 0), (2, 0))))[:, 1:-1] / 2
+    means_v = (np.pad(bayer_data, ((0, 2), (0, 0))) +
+               np.pad(bayer_data, ((2, 0), (0, 0))))[1:-1] / 2
 
-    # green positions first
-    for i in range(0, height, 2):  # green-red rows
-        for j in range(0, width, 2):
-            red[i, j] = (take(bayer_data, i, j - 1) +
-                         take(bayer_data, i, j + 1)) / 2
-            blue[i, j] = (take(bayer_data, i - 1, j) +
-                          take(bayer_data, i + 1, j)) / 2
-    for i in range(1, height, 2):  # green-blue rows
-        for j in range(1, width, 2):
-            blue[i, j] = (take(bayer_data, i, j - 1) +
-                          take(bayer_data, i, j + 1)) / 2
-            red[i, j] = (take(bayer_data, i - 1, j) +
-                         take(bayer_data, i + 1, j)) / 2
-    
-    # now red in blue positions, blue in red positions
+    red = (bayer_data * masks.red + means_h * masks.green_red_row +
+           means_v * masks.green_blue_row)
+    blue = (bayer_data * masks.blue + means_v * masks.green_red_row +
+            means_h * masks.green_blue_row)
+
     red_minus_blue = red - blue
-    for i in range(1, height, 2):
-        for j in range(0, width, 2):
-            if delta_v[i, j] < delta_h[i, j]:
-                red[i, j] = blue[i, j] + (take(red_minus_blue, i - 1, j) +
-                                          take(red_minus_blue, i + 1, j)) / 2
-            else:
-                red[i, j] = blue[i, j] + (take(red_minus_blue, i, j - 1) +
-                                          take(red_minus_blue, i, j + 1)) / 2
-    for i in range(0, height, 2):
-        for j in range(1, width, 2):
-            if delta_v[i, j] < delta_h[i, j]:
-                blue[i, j] = red[i, j] - (take(red_minus_blue, i - 1, j) +
-                                          take(red_minus_blue, i + 1, j)) / 2
-            else:
-                blue[i, j] = red[i, j] - (take(red_minus_blue, i, j - 1) +
-                                          take(red_minus_blue, i, j + 1)) / 2
+
+    means_h = (np.pad(red_minus_blue, ((0, 0), (0, 2))) +
+               np.pad(red_minus_blue, ((0, 0), (2, 0))))[:, 1:-1] / 2
+    means_v = (np.pad(red_minus_blue, ((0, 2), (0, 0))) +
+               np.pad(red_minus_blue, ((2, 0), (0, 0))))[1:-1] / 2
+
+    red += masks.blue * (blue + (1 - classifier_h) * means_v
+                         + classifier_h * means_h)
+    blue += masks.red * (red - (1 - classifier_h) * means_v
+                         - classifier_h * means_h)
+
+    if intermediate is not None:
+        intermediate.append(('step3_no_refining',
+                             np.dstack((red, green, blue))))
 
     return red, blue
 
 
-def replace_high_1d(dst, src, i, j, vertical: bool):
-    if vertical:
-        low_pass = lambda arr, i, j: (take(arr, i - 1, j) + arr[i, j] + take(arr, i + 1, j)) / 3
-    else:
-        low_pass = lambda arr, i, j: (take(arr, i, j - 1) + arr[i, j] + take(arr, i, j + 1)) / 3
-    dst[i, j] = low_pass(dst, i, j) + src[i, j] - low_pass(src, i, j)
+def low_freq(src):
+    return ((np.pad(src, ((0, 0), (0, 2))) + np.pad(src, ((0, 0), (1, 1))) +
+             np.pad(src, ((0, 0), (2, 0))))[:, 1:-1] / 3,
+            (np.pad(src, ((0, 2), (0, 0))) + np.pad(src, ((1, 1), (0, 0))) +
+             np.pad(src, ((2, 0), (0, 0))))[1:-1] / 3)
 
 
-def high_frequency_refining(red, green, blue, delta_h, delta_v):
-    height, width = green.shape
+def _high_frequency_refining(red, green, blue, classifier_h,
+                             masks, intermediate):
+    red_low_h, red_low_v = low_freq(red)
+    green_low_h, green_low_v = low_freq(green)
+    blue_low_h, blue_low_v = low_freq(blue)
 
-    for i in range(0, height, 2):  # red locations
-        for j in range(1, width, 2):
-            replace_high_1d(green, red, i, j, delta_v[i, j] < delta_h[i, j])
+    green = masks.green * green + masks.red * (
+        (1 - classifier_h) * (green_low_v + red - red_low_v) +
+        classifier_h * (green_low_h + red - red_low_h)
+    ) + masks.blue * (
+        (1 - classifier_h) * (green_low_v + blue - blue_low_v) +
+        classifier_h * (green_low_h + blue - blue_low_h)
+    )
 
-    for i in range(1, height, 2):  # blue locations
-        for j in range(0, width, 2):
-            replace_high_1d(green, blue, i, j, delta_v[i, j] < delta_h[i, j])
+    if intermediate is not None:
+        intermediate.append(('step4_refining_1',
+                             np.dstack((red, green, blue))))
 
-    for i in range(0, height, 2):  #  green locations - red rows
-        for j in range(0, width, 2):
-            replace_high_1d(red, green, i, j, vertical=False)
-            replace_high_1d(blue, green, i, j, vertical=True)
+    red_low_h, red_low_v = low_freq(red)
+    green_low_h, green_low_v = low_freq(green)
+    blue_low_h, blue_low_v = low_freq(blue)
 
-    for i in range(1, height, 2):  #  green locations - blue rows
-        for j in range(1, width, 2):
-            replace_high_1d(red, green, i, j, vertical=True)
-            replace_high_1d(blue, green, i, j, vertical=False)
+    red = (red * masks.red_blue +
+           (red_low_h + green - green_low_h) * masks.green_red_row +
+           (red_low_v + green - green_low_v) * masks.green_blue_row)
+    blue = (blue * masks.red_blue +
+            (blue_low_v + green - green_low_v) * masks.green_red_row +
+            (blue_low_v + green - green_low_h) * masks.green_blue_row)
 
-    for i in range(0, height, 2):  # red locations
-        for j in range(1, width, 2):
-            replace_high_1d(blue, red, i, j, delta_v[i, j] < delta_h[i, j])
+    if intermediate is not None:
+        intermediate.append(('step4_refining_2',
+                             np.dstack((red, green, blue))))
+    
+    red_low_h, red_low_v = low_freq(red)
+    blue_low_h, blue_low_v = low_freq(blue)
 
-    for i in range(1, height, 2):  # blue locations
-        for j in range(0, width, 2):
-            replace_high_1d(red, blue, i, j, delta_v[i, j] < delta_h[i, j])
+    blue = blue * (1 - masks.red) + masks.red * (
+        (1 - classifier_h) * (blue_low_v + red - red_low_v) +
+        classifier_h * (blue_low_h + red - red_low_h))
+    red = red * (1 - masks.blue) + masks.blue * (
+        (1 - classifier_h) * (red_low_v + blue - blue_low_v) +
+        classifier_h * (red_low_h + blue - blue_low_h))
+
+    if intermediate is not None:
+        intermediate.append(('step4_refining_3',
+                             np.dstack((red, green, blue))))
 
     return red, green, blue
 
 
-def demosaicing_algorithm(bayer_data):
-    green_h, green_v = directional_green_interpolation(bayer_data)
-    green, delta_h, delta_v = green_decision(bayer_data, green_h, green_v)
-    red, blue = red_blue_interpolation(bayer_data, green, delta_h, delta_v)
-    red, green, blue = high_frequency_refining(red, green, blue,
-                                               delta_h, delta_v)
-    return np.clip(np.dstack((red, green, blue)), 0, 1)
+def demosaicing_algorithm(bayer_data, save_intermediate=False):
+    intermediate = [] if save_intermediate else None
+    masks = BayerMasks(bayer_data.shape[0], bayer_data.shape[1])
+
+    green_h, green_v = _directional_green_interpolation(bayer_data,
+                                                        masks, intermediate)
+    green, classifier_h = _green_decision(bayer_data, green_h, green_v,
+                                          masks, intermediate)
+    red, blue = _red_blue_interpolation(bayer_data, green, classifier_h,
+                                        masks, intermediate)
+    red, green, blue = _high_frequency_refining(red, green, blue, classifier_h,
+                                                masks, intermediate)
+    result = np.clip(np.dstack((red, green, blue)), 0, 1)
+    if save_intermediate:
+        return result, intermediate
+    return result
